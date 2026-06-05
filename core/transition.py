@@ -65,25 +65,56 @@ class GlucoseTransitionAnalyzer:
         self._transitions = self._build_transitions()
         self._matrix = self._build_matrix()
 
-    def _build_labeled(self, df: pd.DataFrame, detail_col: str) -> pd.DataFrame:
-        """각 검진 레코드에 공복혈당 값과 상태 레이블을 부착한다."""
+    @classmethod
+    def _extract_glucose_labeled(
+        cls,
+        df: pd.DataFrame,
+        user_col: str,
+        date_col: str,
+        detail_col: str,
+        source: str = "",
+    ) -> pd.DataFrame:
+        """DataFrame에서 공복혈당 레코드를 추출하여 state·glucose (·source) 컬럼을 부착한다.
+
+        Args:
+            df: 검진 DataFrame
+            user_col: 사용자 식별 컬럼명
+            date_col: 검진일 컬럼명
+            detail_col: 세부 검진 항목 컬럼명
+            source: 출처 레이블. 비어 있으면 source 컬럼을 추가하지 않는다.
+
+        Returns:
+            user_col, date_col, glucose, state (, source) 컬럼을 포함한 DataFrame
+        """
         df = df.reset_index(drop=True).copy()
         df["_rid"] = df.index
 
-        exploded = df[["_rid", self.user_col, self.date_col, detail_col]].explode(detail_col)
+        exploded = df[["_rid", user_col, date_col, detail_col]].explode(detail_col)
         valid = exploded[exploded[detail_col].notna()]
+        if valid.empty:
+            cols = [user_col, date_col, "glucose", "state"]
+            if source:
+                cols.append("source")
+            return pd.DataFrame(columns=cols)
+
         detail = pd.json_normalize(valid[detail_col].tolist())
         detail["_rid"] = valid["_rid"].values
-        detail[self.user_col] = valid[self.user_col].values
-        detail[self.date_col] = valid[self.date_col].values
+        detail[user_col] = valid[user_col].values
+        detail[date_col] = valid[date_col].values
 
         glucose = detail[detail["small_checkup_code"] == GLUCOSE_CODE][
-            ["_rid", self.user_col, self.date_col, "value"]
+            ["_rid", user_col, date_col, "value"]
         ].copy()
         glucose["glucose"] = pd.to_numeric(glucose["value"], errors="coerce")
         glucose = glucose.dropna(subset=["glucose"])
-        glucose["state"] = glucose["glucose"].apply(self._label_state)
-        return glucose.sort_values([self.user_col, self.date_col]).reset_index(drop=True)
+        glucose["state"] = glucose["glucose"].apply(cls._label_state)
+        if source:
+            glucose["source"] = source
+        return glucose.sort_values([user_col, date_col]).reset_index(drop=True)
+
+    def _build_labeled(self, df: pd.DataFrame, detail_col: str) -> pd.DataFrame:
+        """각 검진 레코드에 공복혈당 값과 상태 레이블을 부착한다."""
+        return self._extract_glucose_labeled(df, self.user_col, self.date_col, detail_col)
 
     @staticmethod
     def _label_state(glucose: float) -> str:
@@ -119,6 +150,11 @@ class GlucoseTransitionAnalyzer:
             .reindex(index=STATES, columns=STATES, fill_value=0)
         )
         return matrix
+
+    @property
+    def user_keys(self) -> frozenset[str]:
+        """분석 대상 user_key 집합을 반환한다."""
+        return frozenset(self._labeled[self.user_col].unique())
 
     def summary(self) -> pd.DataFrame:
         """전이 유형별 건수·비율을 DataFrame으로 반환한다."""
@@ -249,18 +285,30 @@ class GlucoseTransitionAnalyzer:
         else:
             plt.close(fig)
 
-    def export_dataset(self, output_path: Path | None = None) -> pd.DataFrame:
-        """2회 수검자 중 첫 상태가 '정상'인 수검자를 분류하여 반환하고 JSON으로 저장한다.
+    def export_dataset(
+        self,
+        output_path: Path | None = None,
+        drug_lookup: dict[str, list[dict[str, str]]] | None = None,
+    ) -> pd.DataFrame:
+        """2회 수검자 중 첫 상태가 '정상' 또는 '당뇨병전단계'인 수검자를 분류하여 반환하고 JSON으로 저장한다.
 
         분류 기준:
-            - "pre-diabetes" : 정상 → 정상
-            - "diabetes"     : 정상 → 당뇨병전단계  또는  정상 → 당뇨병
+            - "pre-diabetes" : 첫 상태 == 정상
+                label=0 : 정상 → 정상
+                label=1 : 정상 → 당뇨병전단계  또는  정상 → 당뇨병
+            - "diabetes"     : 첫 상태 == 당뇨병전단계
+                label=0 : 당뇨병전단계 → 당뇨병전단계  또는  당뇨병전단계 → 정상
+                label=1 : 당뇨병전단계 → 당뇨병
 
         Args:
             output_path: 저장할 JSON 파일 경로. None이면 저장하지 않는다.
+            drug_lookup: MedicalHistoryLoader.load_drug_lookup()의 반환값.
+                None이면 약물 정보를 포함하지 않는다.
 
         Returns:
-            columns: user_key, current_checkup_date, future_checkup_date, dataset
+            columns: user_key, current_checkup_date, future_checkup_date, dataset,
+                     label, selected_transition, full_transition,
+                     current_glucose, future_glucose, glucose_change
         """
         visit_counts = self._labeled.groupby(self.user_col).size()
         two_visit_users = visit_counts[visit_counts == 2].index
@@ -290,6 +338,8 @@ class GlucoseTransitionAnalyzer:
                 continue
 
             pair_transition = f"{first['state']} → {second['state']}"
+            cur_g = float(first["glucose"])
+            fut_g = float(second["glucose"])
             rows.append({
                 "user_key": user,
                 "current_checkup_date": first[self.date_col].strftime("%Y-%m-%d"),
@@ -298,14 +348,18 @@ class GlucoseTransitionAnalyzer:
                 "label": label,
                 "selected_transition": pair_transition,
                 "full_transition": pair_transition,
+                "current_glucose": cur_g,
+                "future_glucose": fut_g,
+                "glucose_change": round(fut_g - cur_g, 1),
             })
 
         df = pd.DataFrame(rows)
 
         if output_path is not None:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            records = {
-                row["user_key"]: {
+            records = {}
+            for _, row in df.iterrows():
+                entry: dict = {
                     "user_key": row["user_key"],
                     "current_checkup_date": row["current_checkup_date"],
                     "future_checkup_date": row["future_checkup_date"],
@@ -313,9 +367,13 @@ class GlucoseTransitionAnalyzer:
                     "label": int(row["label"]),
                     "selected_transition": row["selected_transition"],
                     "full_transition": row["full_transition"],
+                    "current_glucose": row["current_glucose"],
+                    "future_glucose": row["future_glucose"],
+                    "glucose_change": row["glucose_change"],
                 }
-                for _, row in df.iterrows()
-            }
+                if drug_lookup is not None:
+                    entry["diabetes_drugs"] = drug_lookup.get(row["user_key"], [])
+                records[row["user_key"]] = entry
             import json
             output_path.write_text(
                 json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -328,28 +386,31 @@ class GlucoseTransitionAnalyzer:
         self,
         min_visits: int = 3,
         output_path: Path | None = None,
+        drug_lookup: dict[str, list[dict[str, str]]] | None = None,
     ) -> dict[str, pd.DataFrame]:
         """3회 이상 수검자를 pre-diabetes / diabetes 데이터셋으로 분류하여 반환하고 JSON으로 저장한다.
 
+        인접한 (i, i+1) 쌍 외에도, 중간 스텝을 포함하는 (i, j) 다중 스텝 쌍(label=0만)을 추가한다.
+
         분류 기준:
             pre-diabetes
-                - 유효 조건: state[i] == 정상, state[i-1] ∉ {전단계, 당뇨}
-                - label=0: state[i+1] == 정상
-                - label=1: state[i+1] ∈ {전단계, 당뇨}
+                - 유효 조건: state[i] == 정상, state[i-1..] ∉ {전단계, 당뇨}
+                - label=0 (단일): state[i+1] == 정상
+                - label=1 (단일): state[i+1] ∈ {전단계, 당뇨}
+                - label=0 (다중): state[j] == 정상, state[i+1..j-1] 모두 정상 (j > i+1)
             diabetes
-                - 유효 조건: state[i] == 전단계, state[i-1] ≠ 당뇨
-                - label=0: state[i+1] ∈ {전단계, 정상}
-                - label=1: state[i+1] == 당뇨
+                - 유효 조건: state[i] == 전단계, state[i-1..] ≠ 당뇨
+                - label=0 (단일): state[i+1] ∈ {전단계, 정상}
+                - label=1 (단일): state[i+1] == 당뇨
+                - label=0 (다중): state[j] ∈ {전단계, 정상}, state[i+1..j-1] 모두 당뇨 아님 (j > i+1)
 
-        중복 제거 규칙 (동일 dataset 내 user_key는 반드시 유일):
-            - 동일 user_key에 유효한 전이 흐름이 여러 개인 경우
-                · label=0 후보가 여럿: 이후 검진일의 공복혈당이 가장 낮은 검진일 선택
-                · label=1 후보가 여럿: 이후 검진일의 공복혈당이 가장 높은 검진일 선택
-            - label=0 과 label=1 후보가 동시에 존재하는 경우: label=1 을 우선 보존
+        JSON 키는 ``{dataset}::{user_key}::{current_checkup_date}::{future_checkup_date}`` 형태로 고유성을 보장한다.
 
         Args:
             min_visits: 최소 방문 횟수 (기본 3).
             output_path: 저장할 JSON 파일 경로. None이면 저장하지 않는다.
+            drug_lookup: MedicalHistoryLoader.load_drug_lookup()의 반환값.
+                None이면 약물 정보를 포함하지 않는다.
 
         Returns:
             {"pre-diabetes": DataFrame, "diabetes": DataFrame}
@@ -376,66 +437,90 @@ class GlucoseTransitionAnalyzer:
             glucoses = grp["glucose"].tolist()
 
             for i in range(len(states) - 1):
-                prev = states[i - 1] if i > 0 else None
+                prev_states = states[:i]  # 현재 시점 이전의 모든 상태
                 curr, nxt = states[i], states[i + 1]
 
                 base = {
                     "user_key": user,
                     "current_checkup_date": dates[i].strftime("%Y-%m-%d"),
                     "future_checkup_date": dates[i + 1].strftime("%Y-%m-%d"),
+                    "current_glucose": glucoses[i],
                     "future_glucose": glucoses[i + 1],
                     "full_transition": full_transitions[user],
                     "selected_transition": f"{curr} → {nxt}",
                 }
 
-                # pre-diabetes
-                if curr == STATE_NORMAL and prev not in (STATE_PRE, STATE_DM):
+                # pre-diabetes: 과거 전체에 전단계/당뇨 이력 없어야 함
+                no_prior_dm = not any(s in (STATE_PRE, STATE_DM) for s in prev_states)
+                if curr == STATE_NORMAL and no_prior_dm:
                     if nxt == STATE_NORMAL:
                         candidates["pre-diabetes"].append({**base, "dataset": "pre-diabetes", "label": 0})
                     elif nxt in (STATE_PRE, STATE_DM):
                         candidates["pre-diabetes"].append({**base, "dataset": "pre-diabetes", "label": 1})
 
-                # diabetes
-                if curr == STATE_PRE and prev != STATE_DM:
+                # diabetes: 과거 전체에 당뇨 이력 없어야 함
+                no_prior_full_dm = not any(s == STATE_DM for s in prev_states)
+                if curr == STATE_PRE and no_prior_full_dm:
                     if nxt in (STATE_PRE, STATE_NORMAL):
                         candidates["diabetes"].append({**base, "dataset": "diabetes", "label": 0})
                     elif nxt == STATE_DM:
                         candidates["diabetes"].append({**base, "dataset": "diabetes", "label": 1})
+
+            # 다중 스텝 전이 (label=0만): j > i+1인 (i, j) 쌍
+            for i in range(len(states) - 2):
+                prev_states = states[:i]
+                curr = states[i]
+                no_prior_dm = not any(s in (STATE_PRE, STATE_DM) for s in prev_states)
+                no_prior_full_dm = not any(s == STATE_DM for s in prev_states)
+
+                for j in range(i + 2, len(states)):
+                    intermediate = states[i + 1:j]
+                    nxt = states[j]
+                    sel_trans = " → ".join(states[i:j + 1])
+
+                    multi_base = {
+                        "user_key": user,
+                        "current_checkup_date": dates[i].strftime("%Y-%m-%d"),
+                        "future_checkup_date": dates[j].strftime("%Y-%m-%d"),
+                        "current_glucose": glucoses[i],
+                        "future_glucose": glucoses[j],
+                        "full_transition": full_transitions[user],
+                        "selected_transition": sel_trans,
+                    }
+
+                    # pre-diabetes label=0: 중간에 전단계/당뇨 없고 최종이 정상
+                    if (curr == STATE_NORMAL and no_prior_dm and
+                            nxt == STATE_NORMAL and
+                            not any(s in (STATE_PRE, STATE_DM) for s in intermediate)):
+                        candidates["pre-diabetes"].append({**multi_base, "dataset": "pre-diabetes", "label": 0})
+
+                    # diabetes label=0: 중간에 당뇨 없고 최종이 전단계/정상
+                    if (curr == STATE_PRE and no_prior_full_dm and
+                            nxt in (STATE_PRE, STATE_NORMAL) and
+                            not any(s == STATE_DM for s in intermediate)):
+                        candidates["diabetes"].append({**multi_base, "dataset": "diabetes", "label": 0})
 
         result: dict[str, pd.DataFrame] = {}
         for ds, cands in candidates.items():
             if not cands:
                 result[ds] = pd.DataFrame()
                 continue
-
             df_c = pd.DataFrame(cands)
-
-            # 동일 레이블 중복 제거: label=0 → 미래 혈당 최저, label=1 → 미래 혈당 최고
-            best_rows = []
-            for (user, label), grp in df_c.groupby(["user_key", "label"]):
-                if label == 0:
-                    best_rows.append(grp.loc[grp["future_glucose"].idxmin()])
-                else:
-                    best_rows.append(grp.loc[grp["future_glucose"].idxmax()])
-
-            df_best = pd.DataFrame(best_rows)
-
-            # 레이블 혼재 시 label=1 우선
-            df_best = (
-                df_best.sort_values("label", ascending=False)
-                .drop_duplicates(subset=["user_key"], keep="first")
-                .drop(columns=["future_glucose"])
+            df_c["glucose_change"] = (
+                df_c["future_glucose"] - df_c["current_glucose"]
+            ).round(1)
+            result[ds] = (
+                df_c.sort_values([self.user_col, "current_checkup_date"])
                 .reset_index(drop=True)
             )
-            result[ds] = df_best
 
         if output_path is not None:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             records: dict[str, dict] = {}
             for ds, df_out in result.items():
                 for _, row in df_out.iterrows():
-                    key = f"{ds}::{row['user_key']}"
-                    records[key] = {
+                    key = f"{ds}::{row['user_key']}::{row['current_checkup_date']}::{row['future_checkup_date']}"
+                    entry: dict = {
                         "user_key": row["user_key"],
                         "current_checkup_date": row["current_checkup_date"],
                         "future_checkup_date": row["future_checkup_date"],
@@ -443,7 +528,13 @@ class GlucoseTransitionAnalyzer:
                         "label": int(row["label"]),
                         "selected_transition": row["selected_transition"],
                         "full_transition": row["full_transition"],
+                        "current_glucose": row["current_glucose"],
+                        "future_glucose": row["future_glucose"],
+                        "glucose_change": row["glucose_change"],
                     }
+                    if drug_lookup is not None:
+                        entry["diabetes_drugs"] = drug_lookup.get(row["user_key"], [])
+                    records[key] = entry
             import json
             output_path.write_text(
                 json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -451,7 +542,7 @@ class GlucoseTransitionAnalyzer:
             for ds, df_out in result.items():
                 l0 = int((df_out["label"] == 0).sum())
                 l1 = int((df_out["label"] == 1).sum())
-                print(f"[{ds}] 총 {len(df_out):,}명  (label=0: {l0:,}, label=1: {l1:,})")
+                print(f"[{ds}] 총 {len(df_out):,}건  (label=0: {l0:,}, label=1: {l1:,})")
             print(f"Saved: {output_path}")
 
         return result
@@ -541,3 +632,329 @@ class GlucoseTransitionAnalyzer:
             plt.show()
         else:
             plt.close(fig)
+
+
+class CombinedGlucoseTransitionAnalyzer(GlucoseTransitionAnalyzer):
+    """종합·국가 검진을 결합하여 공복혈당 기준 상태 전이를 분석한다.
+
+    공복혈당 기록이 있는 종합·국가 검진 이력을 모두 합산하여 분석 대상으로 사용한다.
+    시각화(summary, plot_transition, plot_sequences)는 출처를 제거한 순수 상태명을 사용한다.
+    JSON export(export_dataset, export_multi_visit_dataset)의 selected_transition /
+    full_transition 필드에는 ``정상(종합) → 정상(국가)`` 형식으로 출처를 표기하며,
+    current_checkup은 반드시 종합검진 이력이어야 한다.
+    """
+
+    SOURCE_TOTAL = "종합"
+    SOURCE_NATIONAL = "국가"
+
+    def __init__(
+        self,
+        total_df: pd.DataFrame,
+        national_df: pd.DataFrame,
+        date_col: str = "checkup_date",
+        user_col: str = "user_key",
+        detail_col: str = "detail_infos",
+    ) -> None:
+        """
+        Args:
+            total_df: 종합검진 DataFrame (DataLoader.load() 결과)
+            national_df: 국가검진 DataFrame (DataLoader.load_streaming() 결과)
+            date_col: 검진일 컬럼명
+            user_col: 사용자 식별 컬럼명
+            detail_col: 세부 검진 항목 컬럼명
+        """
+        self.date_col = date_col
+        self.user_col = user_col
+        self.min_visits = 1
+
+        total_labeled = self._extract_glucose_labeled(
+            total_df, user_col, date_col, detail_col, self.SOURCE_TOTAL
+        )
+        national_labeled = self._extract_glucose_labeled(
+            national_df, user_col, date_col, detail_col, self.SOURCE_NATIONAL
+        )
+        combined = pd.concat([total_labeled, national_labeled], ignore_index=True)
+
+        self._labeled = (
+            combined
+            .sort_values([user_col, date_col])
+            .reset_index(drop=True)
+        )
+        self._transitions = self._build_transitions()
+        self._matrix = self._build_matrix()
+
+    @staticmethod
+    def _filter_eligible_users(
+        total_labeled: pd.DataFrame,
+        combined: pd.DataFrame,
+        user_col: str,
+        date_col: str,
+    ) -> pd.Index:
+        """종합검진 이후 추가 수검 이력(공복혈당 있음)이 존재하는 수검자를 반환한다."""
+        first_total = total_labeled.groupby(user_col)[date_col].min().rename("first_total")
+        last_any = combined.groupby(user_col)[date_col].max().rename("last_any")
+        joined = first_total.to_frame().join(last_any, how="left")
+        return joined[joined["last_any"] > joined["first_total"]].index
+
+    def _build_transitions(self) -> pd.DataFrame:
+        """연속 검진 쌍의 상태 전이를 생성한다 (from_source / to_source 컬럼 포함)."""
+        rows = []
+        for user, group in self._labeled.groupby(self.user_col):
+            grp = group.sort_values(self.date_col)
+            states = grp["state"].tolist()
+            sources = grp["source"].tolist()
+            dates = grp[self.date_col].tolist()
+            for i in range(len(states) - 1):
+                rows.append({
+                    self.user_col: user,
+                    "from_state": states[i],
+                    "from_source": sources[i],
+                    "to_state": states[i + 1],
+                    "to_source": sources[i + 1],
+                    "from_date": dates[i],
+                    "to_date": dates[i + 1],
+                })
+        return pd.DataFrame(rows)
+
+    def export_dataset(
+        self,
+        output_path: Path | None = None,
+        drug_lookup: dict[str, list[dict[str, str]]] | None = None,
+    ) -> pd.DataFrame:
+        """2회 수검자 중 첫 상태가 '정상' 또는 '당뇨병전단계'인 수검자를 분류하여 JSON으로 저장한다.
+
+        selected_transition / full_transition 에 이력 출처(종합/국가)를 괄호로 표기한다.
+        예) 정상(종합) → 정상(국가)
+
+        분류 기준:
+            - "pre-diabetes" : 첫 상태 == 정상
+                label=0 : 정상 → 정상
+                label=1 : 정상 → 당뇨병전단계  또는  정상 → 당뇨병
+            - "diabetes"     : 첫 상태 == 당뇨병전단계
+                label=0 : 당뇨병전단계 → 당뇨병전단계  또는  당뇨병전단계 → 정상
+                label=1 : 당뇨병전단계 → 당뇨병
+        """
+        visit_counts = self._labeled.groupby(self.user_col).size()
+        two_visit_users = visit_counts[visit_counts == 2].index
+        subset = self._labeled[self._labeled[self.user_col].isin(two_visit_users)]
+
+        rows = []
+        for user, group in subset.groupby(self.user_col):
+            group = group.sort_values(self.date_col).dropna(subset=[self.date_col])
+            if len(group) != 2:
+                continue
+            first, second = group.iloc[0], group.iloc[1]
+            if pd.isna(first[self.date_col]) or pd.isna(second[self.date_col]):
+                continue
+
+            dataset: str | None = None
+            label: int | None = None
+
+            if first["state"] == STATE_NORMAL:
+                dataset = "pre-diabetes"
+                label = 0 if second["state"] == STATE_NORMAL else 1
+            elif first["state"] == STATE_PRE:
+                dataset = "diabetes"
+                label = 1 if second["state"] == STATE_DM else 0
+            else:
+                continue
+
+            pair_transition = (
+                f"{first['state']}({first['source']}) → "
+                f"{second['state']}({second['source']})"
+            )
+            cur_g = float(first["glucose"])
+            fut_g = float(second["glucose"])
+            rows.append({
+                "user_key": user,
+                "current_checkup_date": first[self.date_col].strftime("%Y-%m-%d"),
+                "future_checkup_date": second[self.date_col].strftime("%Y-%m-%d"),
+                "dataset": dataset,
+                "label": label,
+                "selected_transition": pair_transition,
+                "full_transition": pair_transition,
+                "current_glucose": cur_g,
+                "future_glucose": fut_g,
+                "glucose_change": round(fut_g - cur_g, 1),
+            })
+
+        df = pd.DataFrame(rows)
+
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            records = {}
+            for _, row in df.iterrows():
+                entry: dict = {
+                    "user_key": row["user_key"],
+                    "current_checkup_date": row["current_checkup_date"],
+                    "future_checkup_date": row["future_checkup_date"],
+                    "dataset": row["dataset"],
+                    "label": int(row["label"]),
+                    "selected_transition": row["selected_transition"],
+                    "full_transition": row["full_transition"],
+                    "current_glucose": row["current_glucose"],
+                    "future_glucose": row["future_glucose"],
+                    "glucose_change": row["glucose_change"],
+                }
+                if drug_lookup is not None:
+                    entry["diabetes_drugs"] = drug_lookup.get(row["user_key"], [])
+                records[row["user_key"]] = entry
+            import json
+            output_path.write_text(
+                json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(f"Saved: {output_path}  ({len(df):,}명)")
+
+        return df
+
+    def export_multi_visit_dataset(
+        self,
+        min_visits: int = 3,
+        output_path: Path | None = None,
+        drug_lookup: dict[str, list[dict[str, str]]] | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        """3회 이상 수검자를 pre-diabetes / diabetes 데이터셋으로 분류하여 JSON으로 저장한다.
+
+        selected_transition / full_transition 에 이력 출처(종합/국가)를 괄호로 표기한다.
+        예) 정상(종합) → 정상(국가) → 정상(종합)
+
+        인접한 (i, i+1) 쌍 외에도, 중간 스텝을 포함하는 (i, j) 다중 스텝 쌍(label=0만)을 추가한다.
+        분류 기준은 GlucoseTransitionAnalyzer.export_multi_visit_dataset 과 동일하다.
+        """
+        visit_counts = self._labeled.groupby(self.user_col).size()
+        target_users = visit_counts[visit_counts >= min_visits].index
+        subset = self._labeled[self._labeled[self.user_col].isin(target_users)]
+
+        full_transitions: dict[str, str] = {
+            user: " → ".join(
+                f"{s}({src})"
+                for s, src in zip(
+                    grp.sort_values(self.date_col)["state"],
+                    grp.sort_values(self.date_col)["source"],
+                )
+            )
+            for user, grp in subset.groupby(self.user_col)
+        }
+
+        candidates: dict[str, list[dict]] = {"pre-diabetes": [], "diabetes": []}
+
+        for user, group in subset.groupby(self.user_col):
+            grp = (
+                group.sort_values(self.date_col)
+                .dropna(subset=[self.date_col, "glucose"])
+                .reset_index(drop=True)
+            )
+            states = grp["state"].tolist()
+            sources = grp["source"].tolist()
+            dates = grp[self.date_col].tolist()
+            glucoses = grp["glucose"].tolist()
+
+            for i in range(len(states) - 1):
+                prev_states = states[:i]
+                curr, nxt = states[i], states[i + 1]
+                curr_src, nxt_src = sources[i], sources[i + 1]
+
+                base = {
+                    "user_key": user,
+                    "current_checkup_date": dates[i].strftime("%Y-%m-%d"),
+                    "future_checkup_date": dates[i + 1].strftime("%Y-%m-%d"),
+                    "current_glucose": glucoses[i],
+                    "future_glucose": glucoses[i + 1],
+                    "full_transition": full_transitions[user],
+                    "selected_transition": f"{curr}({curr_src}) → {nxt}({nxt_src})",
+                }
+
+                no_prior_dm = not any(s in (STATE_PRE, STATE_DM) for s in prev_states)
+                if curr == STATE_NORMAL and no_prior_dm:
+                    if nxt == STATE_NORMAL:
+                        candidates["pre-diabetes"].append({**base, "dataset": "pre-diabetes", "label": 0})
+                    elif nxt in (STATE_PRE, STATE_DM):
+                        candidates["pre-diabetes"].append({**base, "dataset": "pre-diabetes", "label": 1})
+
+                no_prior_full_dm = not any(s == STATE_DM for s in prev_states)
+                if curr == STATE_PRE and no_prior_full_dm:
+                    if nxt in (STATE_PRE, STATE_NORMAL):
+                        candidates["diabetes"].append({**base, "dataset": "diabetes", "label": 0})
+                    elif nxt == STATE_DM:
+                        candidates["diabetes"].append({**base, "dataset": "diabetes", "label": 1})
+
+            # 다중 스텝 전이 (label=0만): j > i+1인 (i, j) 쌍
+            for i in range(len(states) - 2):
+                prev_states = states[:i]
+                curr = states[i]
+                no_prior_dm = not any(s in (STATE_PRE, STATE_DM) for s in prev_states)
+                no_prior_full_dm = not any(s == STATE_DM for s in prev_states)
+
+                for j in range(i + 2, len(states)):
+                    intermediate = states[i + 1:j]
+                    nxt = states[j]
+                    sel_trans = " → ".join(
+                        f"{states[k]}({sources[k]})" for k in range(i, j + 1)
+                    )
+
+                    multi_base = {
+                        "user_key": user,
+                        "current_checkup_date": dates[i].strftime("%Y-%m-%d"),
+                        "future_checkup_date": dates[j].strftime("%Y-%m-%d"),
+                        "current_glucose": glucoses[i],
+                        "future_glucose": glucoses[j],
+                        "full_transition": full_transitions[user],
+                        "selected_transition": sel_trans,
+                    }
+
+                    # pre-diabetes label=0: 중간에 전단계/당뇨 없고 최종이 정상
+                    if (curr == STATE_NORMAL and no_prior_dm and
+                            nxt == STATE_NORMAL and
+                            not any(s in (STATE_PRE, STATE_DM) for s in intermediate)):
+                        candidates["pre-diabetes"].append({**multi_base, "dataset": "pre-diabetes", "label": 0})
+
+                    # diabetes label=0: 중간에 당뇨 없고 최종이 전단계/정상
+                    if (curr == STATE_PRE and no_prior_full_dm and
+                            nxt in (STATE_PRE, STATE_NORMAL) and
+                            not any(s == STATE_DM for s in intermediate)):
+                        candidates["diabetes"].append({**multi_base, "dataset": "diabetes", "label": 0})
+
+        result: dict[str, pd.DataFrame] = {}
+        for ds, cands in candidates.items():
+            if not cands:
+                result[ds] = pd.DataFrame()
+                continue
+            df_c = pd.DataFrame(cands)
+            df_c["glucose_change"] = (df_c["future_glucose"] - df_c["current_glucose"]).round(1)
+            result[ds] = (
+                df_c.sort_values([self.user_col, "current_checkup_date"])
+                .reset_index(drop=True)
+            )
+
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            records: dict[str, dict] = {}
+            for ds, df_out in result.items():
+                for _, row in df_out.iterrows():
+                    key = f"{ds}::{row['user_key']}::{row['current_checkup_date']}::{row['future_checkup_date']}"
+                    entry: dict = {
+                        "user_key": row["user_key"],
+                        "current_checkup_date": row["current_checkup_date"],
+                        "future_checkup_date": row["future_checkup_date"],
+                        "dataset": row["dataset"],
+                        "label": int(row["label"]),
+                        "selected_transition": row["selected_transition"],
+                        "full_transition": row["full_transition"],
+                        "current_glucose": row["current_glucose"],
+                        "future_glucose": row["future_glucose"],
+                        "glucose_change": row["glucose_change"],
+                    }
+                    if drug_lookup is not None:
+                        entry["diabetes_drugs"] = drug_lookup.get(row["user_key"], [])
+                    records[key] = entry
+            import json
+            output_path.write_text(
+                json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            for ds, df_out in result.items():
+                l0 = int((df_out["label"] == 0).sum())
+                l1 = int((df_out["label"] == 1).sum())
+                print(f"[{ds}] 총 {len(df_out):,}건  (label=0: {l0:,}, label=1: {l1:,})")
+            print(f"Saved: {output_path}")
+
+        return result

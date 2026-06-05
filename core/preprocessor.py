@@ -216,17 +216,6 @@ class ClinicalPreprocessor:
         """혈압 교환 후 임상 대체까지 전처리 파이프라인을 적용한다."""
         return self.transform_imputations(self.fix_blood_pressure(df))
 
-    def imputation_summary(self) -> pd.DataFrame:
-        """적용된 대체 규칙 요약을 반환한다."""
-        if not self._imputation_log:
-            return pd.DataFrame(columns=["field", "filled_count", "rule"])
-        return pd.DataFrame(
-            {
-                "field": [r.field for r in self._imputation_log],
-                "filled_count": [r.filled_count for r in self._imputation_log],
-                "rule": [r.rule for r in self._imputation_log],
-            }
-        )
 
     def blood_pressure_swap_summary(self) -> pd.DataFrame:
         """혈압 반대 기입 교환 내역 요약을 반환한다."""

@@ -80,23 +80,73 @@ class MissingValueAnalyzer:
             })
         return pd.DataFrame(rows)
 
-    def plot_missing(self, output_dir: Path | None = None, show: bool = True) -> None:
+    def plot_missing(
+        self,
+        output_dir: Path | None = None,
+        show: bool = True,
+        filename: str = "missing_value_analysis.png",
+    ) -> None:
         """항목별 결측/측정 비율을 수평 누적 막대 차트로 시각화한다.
 
         Args:
             output_dir: 저장 경로. None이면 파일로 저장하지 않는다.
             show: True이면 plt.show()를 호출한다.
+            filename: 저장할 파일명 (기본값: "missing_value_analysis.png").
         """
-        summary = self.summary()
-        labels = summary["field_name"].tolist()
-        present_pct = (summary["present_records"] / summary["total_records"] * 100).tolist()
-        missing_pct = summary["missing_rate_pct"].tolist()
-
-        fig, ax = plt.subplots(figsize=(9, max(3, len(labels) * 1.2)))
+        fig, ax = plt.subplots(figsize=(9, max(3, len(self.fields) * 1.2)))
         fig.suptitle(
             f"결측치 현황 (반복 수검자 {len(self._repeat_df):,}건 기준)",
             fontsize=13, fontweight="bold",
         )
+        self._draw_missing_bars(ax, self.summary())
+        plt.tight_layout()
+        self._save_or_show(fig, output_dir, filename, show)
+
+    @classmethod
+    def plot_missing_comparison(
+        cls,
+        sources: list[tuple[str, "MissingValueAnalyzer"]],
+        output_dir: Path | None = None,
+        show: bool = True,
+        filename: str = "missing_value_analysis.png",
+    ) -> None:
+        """여러 데이터소스의 결측 현황을 하나의 그림에 나란히 시각화한다.
+
+        Args:
+            sources: [(레이블, MissingValueAnalyzer), ...] 리스트.
+            output_dir: 저장 경로. None이면 파일로 저장하지 않는다.
+            show: True이면 plt.show()를 호출한다.
+            filename: 저장할 파일명 (기본값: "missing_value_analysis.png").
+        """
+        n = len(sources)
+        row_heights = [max(2, len(analyzer.fields) * 1.2) for _, analyzer in sources]
+        fig, axes = plt.subplots(
+            n, 1,
+            figsize=(9, sum(row_heights) + 0.8),
+            gridspec_kw={"height_ratios": row_heights},
+        )
+        if n == 1:
+            axes = [axes]
+
+        fig.suptitle("결측치 현황 비교", fontsize=13, fontweight="bold")
+
+        for ax, (label, analyzer) in zip(axes, sources):
+            ax.set_title(
+                f"{label}  (반복 수검자 {len(analyzer._repeat_df):,}건 기준)",
+                fontsize=11,
+            )
+            analyzer._draw_missing_bars(ax, analyzer.summary())
+
+        plt.tight_layout()
+        cls._save_or_show(fig, output_dir, filename, show)
+
+    # ── internal helpers ───────────────────────────────────────────────────
+
+    def _draw_missing_bars(self, ax: plt.Axes, summary: pd.DataFrame) -> None:
+        """수평 누적 막대 차트를 ax에 그린다."""
+        labels = summary["field_name"].tolist()
+        present_pct = (summary["present_records"] / summary["total_records"] * 100).tolist()
+        missing_pct = summary["missing_rate_pct"].tolist()
 
         y = range(len(labels))
         bars_p = ax.barh(list(y), present_pct, color="#4C72B0", label="측정")
@@ -123,14 +173,19 @@ class MissingValueAnalyzer:
                     ha="center", va="center", fontsize=9, color="white", fontweight="bold",
                 )
 
-        plt.tight_layout()
-
+    @staticmethod
+    def _save_or_show(
+        fig: plt.Figure,
+        output_dir: Path | None,
+        filename: str,
+        show: bool,
+    ) -> None:
+        """그림을 저장하거나 화면에 표시한다."""
         if output_dir is not None:
             output_dir.mkdir(parents=True, exist_ok=True)
-            save_path = output_dir / "missing_value_analysis.png"
+            save_path = output_dir / filename
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
             print(f"Saved: {save_path}")
-
         if show:
             plt.show()
         else:

@@ -112,9 +112,11 @@ class PreprocessingPipeline:
                         [
                             "field",
                             "numeric_ratio",
+                            "extracted_count",
                             "blanked_count",
                             "dtype_before",
                             "dtype_after",
+                            "extracted_values",
                             "excluded_values",
                         ]
                     ]
@@ -158,6 +160,27 @@ class PreprocessingPipeline:
                 for outcome, line in self.lab_encoder.field_mapping_lines(field).items():
                     print(f"  {outcome}: {line}")
 
+    def inspect_text_columns(self) -> None:
+        """정성 검사·메타 컬럼을 제외한 object dtype 컬럼의 유목을 출력한다."""
+        exclude = (
+            MostlyNumericCoercer.DEFAULT_EXCLUDE_COLUMNS
+            | frozenset(QualitativeLabEncoder.QUALITATIVE_COLUMNS)
+        )
+        for name, df in self.processed.items():
+            text_cols = [
+                col for col in df.select_dtypes(include=["object", "string"]).columns
+                if col not in exclude
+            ]
+            print(f"\n[{name}] 텍스트 인자 ({len(text_cols)}개)")
+            if not text_cols:
+                print("  없음")
+                continue
+            for col in text_cols:
+                series = df[col].dropna()
+                series = series[series.astype(str).str.strip() != ""]
+                uniq = sorted(series.astype(str).unique())
+                print(f"  {col} (비결측 {len(series):,}건, 유목 {len(uniq)}개): {uniq}")
+
     def run_range_blanking(self) -> None:
         """임상 불가능 수치 공백 처리."""
         for name, df in self.processed.items():
@@ -175,14 +198,11 @@ class PreprocessingPipeline:
         for name in self.processed:
             before_impute = self.processed[name].copy()
             self.processed[name] = self.preprocessor.transform_imputations(self.processed[name])
-            self.imputation_reports[name] = self.preprocessor.imputation_summary()
             self.missing_reports[name] = self.preprocessor.missing_rate_comparison(
                 before_impute, self.processed[name]
             )
 
             print(f"\n[{name}] 임상·결측 보완")
-            if not self.imputation_reports[name].empty:
-                self._display(self.imputation_reports[name])
 
             missing_display = self.missing_reports[name].copy()
             for col in ("missing_pct_before", "missing_pct_after"):

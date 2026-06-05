@@ -48,7 +48,12 @@ class CheckupDateAnalyzer:
             "unique_years": sorted(self._dates.dt.year.unique().tolist()),
         }
 
-    def plot_distribution(self, output_dir: Path | None = None, show: bool = True) -> None:
+    def plot_distribution(
+        self,
+        output_dir: Path | None = None,
+        show: bool = True,
+        filename: str = "total_checkup_date_distribution.png",
+    ) -> None:
         """연도·월별 검진 건수 분포를 시각화한다.
 
         상단 stats 패널에 총 검진 건수·인원·기간을 표시하고,
@@ -57,6 +62,7 @@ class CheckupDateAnalyzer:
         Args:
             output_dir: 저장 경로. None이면 파일로 저장하지 않는다.
             show: True이면 plt.show()를 호출한다.
+            filename: 저장할 파일명 (기본값: "total_checkup_date_distribution.png").
         """
         import matplotlib.dates as mdates
         import matplotlib.gridspec as gridspec
@@ -130,7 +136,7 @@ class CheckupDateAnalyzer:
 
         if output_dir is not None:
             output_dir.mkdir(parents=True, exist_ok=True)
-            save_path = output_dir / "checkup_date_distribution.png"
+            save_path = output_dir / filename
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
             print(f"Saved: {save_path}")
 
